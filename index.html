@@ -1,18 +1,16 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>PDF OCR</title>
+  <title>PDF OCR Live</title>
   <style>
-    body { font-family: Arial; padding: 20px; max-width: 700px; margin: auto; }
-    textarea { width: 100%; height: 200px; margin-top: 10px; }
-    pre { background: #f4f4f4; padding: 10px; border-radius: 5px; max-height: 250px; overflow-y: auto; }
-    button { padding: 10px 20px; margin-top: 10px; }
+    body { font-family: Arial; max-width: 700px; margin: auto; padding: 20px; }
+    textarea { width:100%; height:200px; margin-top:10px; }
+    #logBox { background:#f0f0f0; padding:10px; height:250px; overflow-y:auto; white-space:pre-line; }
   </style>
 </head>
-
 <body>
 
-<h2>PDF OCR (Select Page)</h2>
+<h2>PDF OCR with Live Debug Stream</h2>
 
 <form id="ocrForm">
   <label>Upload PDF:</label><br>
@@ -21,55 +19,75 @@
   <label>Page Number:</label><br>
   <input type="number" id="page" min="1" required><br><br>
 
-  <button type="submit">Process OCR</button>
+  <button type="submit">Start OCR</button>
 </form>
+
+<h3>Live Debug</h3>
+<div id="logBox"></div>
 
 <h3>OCR Result</h3>
 <textarea id="output"></textarea>
-<button onclick="copyText()">Copy</button>
-
-<h3>Debug Info</h3>
-<button onclick="toggleDebug()">Show Debug</button>
-<pre id="debugBox" style="display:none;"></pre>
 
 <script>
-async function ocrFile(pdf, page) {
-  const formData = new FormData();
-  formData.append("pdf", pdf);
-  formData.append("page", page);
-
-  const res = await fetch("/ocr", {
-    method: "POST",
-    body: formData
-  });
-
-  return res.json();
-}
-
-document.getElementById("ocrForm").onsubmit = async (e) => {
+document.getElementById("ocrForm").onsubmit = function(e) {
   e.preventDefault();
 
   const pdf = document.getElementById("pdf").files[0];
   const page = document.getElementById("page").value;
+  const logBox = document.getElementById("logBox");
+  logBox.textContent = "Starting...\n";
 
-  const data = await ocrFile(pdf, page);
+  const formData = new FormData();
+  formData.append("pdf", pdf);
+  formData.append("page", page);
 
-  document.getElementById("output").value = data.text || data.error;
+  const evtSource = new EventSourcePolyfill("/ocr-stream", {
+    method: "POST",
+    body: formData
+  });
 
-  if (data.debug) {
-    document.getElementById("debugBox").textContent =
-      data.debug.join("\n");
-  }
+  evtSource.onmessage = (event) => {
+    // If final OCR payload comes
+    if (event.data.startsWith("{")) {
+      const result = JSON.parse(event.data);
+      document.getElementById("output").value = result.ocr_text;
+    } else {
+      logBox.textContent += event.data + "\n";
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+  };
+
+  evtSource.onerror = () => {
+    logBox.textContent += "Error receiving events.\n";
+    evtSource.close();
+  };
 };
 
-function copyText() {
-  navigator.clipboard.writeText(document.getElementById("output").value);
-  alert("Copied!");
-}
+// EventSource Polyfill for POST support
+class EventSourcePolyfill {
+  constructor(url, options) {
+    const xhr = new XMLHttpRequest();
+    xhr.open(options.method || "GET", url);
+    xhr.onload = () => {};
+    xhr.send(options.body);
+    this.xhr = xhr;
 
-function toggleDebug() {
-  const box = document.getElementById("debugBox");
-  box.style.display = box.style.display === "none" ? "block" : "none";
+    const reader = new ReadableStream({
+      start(controller) {
+        xhr.onprogress = () => {
+          let chunk = xhr.responseText.substring(controller.lastIndex || 0);
+          controller.lastIndex = xhr.responseText.length;
+          chunk.split("\n\n").forEach((msg) => {
+            if (msg.startsWith("data:")) {
+              const data = msg.replace("data:", "").trim();
+              if (this.onmessage) this.onmessage({ data });
+            }
+          });
+        };
+      }
+    });
+  }
+  close() { this.xhr.abort(); }
 }
 </script>
 

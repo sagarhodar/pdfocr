@@ -1,62 +1,70 @@
 from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pdf2image import convert_from_path
 import pytesseract
 import traceback
-import os
+import json
+import time
 
 app = FastAPI()
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    with open("index.html", "r") as f:
-        return f.read()
+    return open("index.html").read()
 
 
-@app.post("/ocr")
-async def ocr_pdf(pdf: UploadFile, page: int = Form(...)):
-    debug_log = []
+def stream_debug_logs(pdf_file, page_num):
+    log = lambda msg: f"data: {msg}\n\n"
 
     try:
-        debug_log.append("Received OCR request")
-        debug_log.append(f"Uploaded file: {pdf.filename}")
-        debug_log.append(f"Requested page: {page}")
+        yield log("Received OCR request...")
+        time.sleep(0.3)
+
+        yield log(f"Uploaded file: {pdf_file.filename}")
+        time.sleep(0.3)
+
+        yield log(f"Requested page: {page_num}")
+        time.sleep(0.3)
 
         temp_pdf = "temp.pdf"
-
-        # Save the file
         with open(temp_pdf, "wb") as f:
-            f.write(await pdf.read())
+            f.write(pdf_file.file.read())
+        yield log("Saved temp.pdf")
+        time.sleep(0.3)
 
-        debug_log.append("Saved temp.pdf")
-
-        # Convert PDF → images
+        # Convert PDF to images
+        yield log("Converting PDF into images...")
         images = convert_from_path(temp_pdf)
-        debug_log.append(f"PDF converted into {len(images)} images")
+        yield log(f"PDF has {len(images)} pages.")
+        time.sleep(0.3)
 
-        if page < 1 or page > len(images):
-            return {
-                "error": f"Invalid page {page}. PDF has {len(images)} pages.",
-                "debug": debug_log
-            }
+        if page_num < 1 or page_num > len(images):
+            yield log(f"ERROR: Invalid page {page_num}.")
+            return
 
-        img = images[page - 1]
-        debug_log.append(f"Selected page {page} for OCR")
+        yield log(f"Extracting page {page_num}...")
+        img = images[page_num - 1]
+        time.sleep(0.3)
 
         # OCR
+        yield log("Running OCR...")
         text = pytesseract.image_to_string(img)
-        debug_log.append("OCR completed successfully")
+        yield log("OCR completed.")
+        time.sleep(0.3)
 
-        return {"text": text, "debug": debug_log}
+        # Return OCR result as final payload
+        payload = json.dumps({"ocr_text": text})
+        yield f"data: {payload}\n\n"
 
     except Exception as e:
-        error_message = str(e)
-        debug_log.append("Exception occurred!")
-        debug_log.append(error_message)
-        debug_log.append(traceback.format_exc())
+        err_msg = traceback.format_exc()
+        yield f"data: ERROR: {err_msg}\n\n"
 
-        return JSONResponse(
-            status_code=500,
-            content={"error": error_message, "debug": debug_log}
-        )
+
+@app.post("/ocr-stream")
+async def ocr_stream(pdf: UploadFile, page: int = Form(...)):
+    return StreamingResponse(
+        stream_debug_logs(pdf, page),
+        media_type="text/event-stream"
+    )
