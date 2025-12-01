@@ -1,105 +1,202 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>PDF OCR Live</title>
+  <meta charset="utf-8"/>
+  <title>PDF OCR - Live Strips</title>
   <style>
-    body { font-family: Arial; max-width: 700px; margin: auto; padding: 20px; }
-    textarea { width:100%; height:200px; margin-top:10px; }
-    #logBox { background:#f0f0f0; padding:10px; height:250px; overflow-y:auto; white-space:pre-line; }
-    button { padding:10px 20px; margin-top:10px; }
+    body { font-family: Arial; max-width:900px; margin:auto; padding:20px; }
+    input, button { padding:8px; font-size:14px; }
+    #logBox { background:#111; color:#0f0; padding:12px; height:220px; overflow:auto; white-space:pre-wrap; font-family:monospace; }
+    textarea { width:100%; height:220px; margin-top:10px; }
+    .row { display:flex; gap:10px; align-items:center; margin-bottom:8px; }
+    label { min-width:110px; display:inline-block; }
+    .small { font-size:13px; color:#666; }
   </style>
 </head>
-
 <body>
+  <h2>PDF OCR — Live Strip-based Streaming</h2>
 
-<h2>PDF OCR with Live Status</h2>
+  <div class="row">
+    <label>Upload PDF</label>
+    <input type="file" id="pdf" accept="application/pdf"/>
+  </div>
 
-<form id="ocrForm">
-  <label>Upload PDF:</label><br>
-  <input type="file" id="pdf" accept="application/pdf" required><br><br>
+  <div class="row">
+    <label>Page(s)</label>
+    <input type="text" id="pages" placeholder="e.g. 3 or 3-6 or 1,3,5" style="width:260px"/>
+    <button id="start">Start OCR</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
 
-  <label>Page Number:</label><br>
-  <input type="number" id="page" min="1" required><br><br>
+  <div class="row">
+    <label class="small">Progress</label>
+    <div id="progress" class="small">idle</div>
+  </div>
 
-  <button type="submit">Start OCR</button>
-</form>
+  <h3>Live Debug / Partial Output</h3>
+  <div id="logBox">idle</div>
 
-<h3>Live Debug Log</h3>
-<div id="logBox">Waiting...</div>
-
-<h3>OCR Result</h3>
-<textarea id="output"></textarea>
-<button onclick="copyText()">Copy Text</button>
+  <h3>Final OCR Output</h3>
+  <textarea id="output" placeholder="Final merged OCR text will appear here..."></textarea>
+  <div style="margin-top:8px;">
+    <button id="copy">Copy Text</button>
+  </div>
 
 <script>
-// ---- Start OCR ----
-document.getElementById("ocrForm").onsubmit = function(e) {
-  e.preventDefault();
+let evt = null;
+let stopped = false;
 
-  const pdf = document.getElementById("pdf").files[0];
-  const page = document.getElementById("page").value;
-  const logBox = document.getElementById("logBox");
-  logBox.textContent = "Starting...\n";
+document.getElementById("start").onclick = async () => {
+  stopped = false;
+  const fileEl = document.getElementById("pdf");
+  const pages = document.getElementById("pages").value.trim();
+  if (!fileEl.files.length) { alert("Choose a PDF file"); return; }
+  if (!pages) { alert("Enter pages (e.g. 3-5 or 2)"); return; }
 
-  const formData = new FormData();
-  formData.append("pdf", pdf);
-  formData.append("page", page);
+  document.getElementById("logBox").textContent = "Starting...\n";
+  document.getElementById("output").value = "";
+  document.getElementById("progress").textContent = "Connecting...";
+  document.getElementById("start").disabled = true;
+  document.getElementById("stop").disabled = false;
 
-  // Create EventSource polyfill for POST streaming
-  const evt = new EventSourcePolyfill("/ocr-stream", {
-    method: "POST",
-    body: formData
-  });
+  const form = new FormData();
+  form.append("pdf", fileEl.files[0]);
+  form.append("pages", pages);
 
-  evt.onmessage = (event) => {
-    // Final OCR JSON arrives here
-    if (event.data.startsWith("{")) {
-      const result = JSON.parse(event.data);
-      document.getElementById("output").value = result.ocr_text;
+  // EventSource polyfill using XHR streaming (POST)
+  evt = new EventSourcePolyfill("/ocr-stream", { method: "POST", body: form });
+
+  evt.onmessage = (e) => {
+    const data = e.data;
+    if (data.startsWith("LOG:")) {
+      appendLog(data.replace("LOG:", "").trim());
+    } else if (data.startsWith("PARTIAL:")) {
+      // PARTIAL: page:strip:escaped_text
+      const rest = data.replace("PARTIAL:", "").trim();
+      const firstColon = rest.indexOf(":");
+      // find second colon
+      const secondColon = rest.indexOf(":", firstColon + 1);
+      const page = rest.substring(0, firstColon);
+      const strip = rest.substring(firstColon + 1, secondColon);
+      const text = rest.substring(secondColon + 1).replace(/\\n/g, "\n");
+      appendLog(`[PAGE ${page}][STRIP ${strip}] partial (${text.length} chars)`);
+      // append partial to output (live)
+      const out = document.getElementById("output");
+      out.value += text;
+    } else if (data.startsWith("PAGE_DONE:")) {
+      // PAGE_DONE: page:json_text
+      const payload = data.replace("PAGE_DONE:", "").trim();
+      const sep = payload.indexOf(":");
+      const page = payload.substring(0, sep);
+      const jsontext = payload.substring(sep + 1);
+      try {
+        const merged = JSON.parse(jsontext);
+        appendLog(`[PAGE ${page}] merged (${merged.length} chars)`);
+        // replace the last appended partials for that page with merged? Simpler: keep final appended text
+      } catch(e){
+        appendLog(`[PAGE ${page}] done (could not parse merged text)`);
+      }
+    } else if (data.startsWith("FINAL:")) {
+      const jsontext = data.replace("FINAL:", "").trim();
+      try {
+        const finalText = JSON.parse(jsontext);
+        appendLog("[FINAL] full OCR received");
+        // place final in output (replace to ensure correct order)
+        document.getElementById("output").value = finalText;
+      } catch(e) {
+        appendLog("[FINAL] parse error");
+      }
+      finishStream();
+    } else if (data.startsWith("PROGRESS:")) {
+      // PROGRESS: current/total,current_strip/strips,eta
+      const p = data.replace("PROGRESS:", "").trim();
+      document.getElementById("progress").textContent = p;
+    } else if (data.startsWith("ERROR:")) {
+      appendLog("[ERROR] " + data.replace("ERROR:", "").trim());
+      finishStream();
     } else {
-      logBox.textContent += event.data + "\n";
-      logBox.scrollTop = logBox.scrollHeight;
+      // catch-all
+      appendLog(data);
     }
   };
 
   evt.onerror = () => {
-    logBox.textContent += "\nConnection closed or error.\n";
-    evt.close();
+    appendLog("[stream] connection closed or error");
+    finishStream();
   };
 };
 
-// ---- Copy Text ----
-function copyText() {
-  const txt = document.getElementById("output").value;
-  navigator.clipboard.writeText(txt);
+document.getElementById("stop").onclick = () => {
+  stopped = true;
+  if (evt) evt.close();
+  finishStream();
+};
+
+function finishStream(){
+  if (evt) try { evt.close(); } catch(e){}
+  document.getElementById("start").disabled = false;
+  document.getElementById("stop").disabled = true;
+  document.getElementById("progress").textContent = "idle";
+}
+
+function appendLog(s){
+  const lb = document.getElementById("logBox");
+  lb.textContent += s + "\n";
+  lb.scrollTop = lb.scrollHeight;
+}
+
+document.getElementById("copy").onclick = () => {
+  const t = document.getElementById("output").value;
+  navigator.clipboard.writeText(t);
   alert("Copied!");
 }
 
-// ---- Polyfill: SSE + POST ----
+/* EventSource polyfill supporting POST & streaming chunk parsing */
 class EventSourcePolyfill {
   constructor(url, options) {
-    const xhr = new XMLHttpRequest();
-    xhr.open(options.method || "GET", url);
-    xhr.responseType = "text";
-    xhr.send(options.body);
-    this.xhr = xhr;
+    this.xhr = new XMLHttpRequest();
+    this.url = url;
+    this.onmessage = null;
+    this.onerror = null;
 
+    this.xhr.open(options.method || "GET", url);
+    // stream
+    this.xhr.responseType = "text";
+    const self = this;
     let lastIndex = 0;
-    xhr.onprogress = () => {
-      let chunk = xhr.responseText.substring(lastIndex);
-      lastIndex = xhr.responseText.length;
 
-      chunk.split("\n\n").forEach(line => {
-        if (line.startsWith("data:")) {
-          let data = line.replace("data:", "").trim();
-          if (this.onmessage) this.onmessage({ data });
+    this.xhr.onreadystatechange = function() {
+      if (self.xhr.readyState === 3 || self.xhr.readyState === 4) {
+        try {
+          const text = self.xhr.responseText.substring(lastIndex);
+          lastIndex = self.xhr.responseText.length;
+          if (text) {
+            // split by SSE event delimiter \n\n
+            const parts = text.split("\n\n");
+            parts.forEach(p => {
+              p = p.trim();
+              if (!p) return;
+              // lines maybe like "data: ...", support multi-line data
+              const lines = p.split("\n");
+              let dataLine = lines.map(l => l.replace(/^data:\s?/, "")).join("\n");
+              if (self.onmessage) self.onmessage({ data: dataLine });
+            });
+          }
+        } catch (err) {
+          if (self.onerror) self.onerror(err);
         }
-      });
+      }
+      if (self.xhr.readyState === 4 && self.xhr.status >= 400) {
+        if (self.onerror) self.onerror(new Error("HTTP error " + self.xhr.status));
+      }
     };
+
+    this.xhr.send(options.body);
   }
-  close() { this.xhr.abort(); }
+  close() {
+    try { this.xhr.abort(); } catch(e) {}
+  }
 }
 </script>
-
 </body>
 </html>
