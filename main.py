@@ -40,7 +40,7 @@ def stream_debug_logs(pdf_file, page_num):
             temp_pdf,
             first_page=page_num,
             last_page=page_num,
-            dpi=120   # Lower DPI = lower RAM usage
+            dpi=320   # Lower DPI = lower RAM usage
         )
         img = images[0]
         yield log("Page converted to image.")
